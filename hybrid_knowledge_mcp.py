@@ -71,6 +71,7 @@ import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import hashlib  # noqa: E402
 import heapq  # noqa: E402
+import importlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -613,6 +614,15 @@ def classify(path: Path) -> tuple[str, str]:
 # 6. Эмбеддинги                                                                #
 # --------------------------------------------------------------------------- #
 
+def _embedding_dimension(model: Any) -> int:
+    """В sentence-transformers 6.x метод переименован — поддерживаем оба имени."""
+    for attribute in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        getter = getattr(model, attribute, None)
+        if callable(getter):
+            return int(getter())
+    return 0
+
+
 class Embedder:
     """Ленивая обёртка над SentenceTransformer. Модель грузится один раз."""
 
@@ -624,7 +634,7 @@ class Embedder:
 
     @property
     def dimension(self) -> int:
-        return int(self.model.get_sentence_embedding_dimension())
+        return _embedding_dimension(self.model)
 
     @property
     def model(self) -> Any:
@@ -640,11 +650,22 @@ class Embedder:
             log.info("Загружаю модель эмбеддингов %s (CPU)...", self.model_name)
             from sentence_transformers import SentenceTransformer  # тяжёлый импорт
 
-            self._model = SentenceTransformer(self.model_name, device="cpu")
+            # Сначала пробуем строго из локального кэша: установщик уже скачал
+            # модель, так что это и быстрее, и работает без сети (VPN, офлайн).
+            # Если кэша нет — идём в Hugging Face.
+            try:
+                self._model = SentenceTransformer(
+                    self.model_name, device="cpu", local_files_only=True
+                )
+            except Exception as error:  # noqa: BLE001 — нет кэша или старый API
+                log.info("Локального кэша модели нет (%s), скачиваю с Hugging Face...",
+                         type(error).__name__)
+                self._model = SentenceTransformer(self.model_name, device="cpu")
+
             log.info(
                 "Модель готова за %.1f c, размерность %d",
                 time.perf_counter() - started,
-                self._model.get_sentence_embedding_dimension(),
+                _embedding_dimension(self._model),
             )
         return self._model
 
@@ -1227,6 +1248,44 @@ class KnowledgeBase:
 
     # ------------------------------ Очистка ------------------------------ #
 
+    def _release_chroma(self) -> None:
+        """
+        Полностью отпускает ChromaDB перед удалением файлов с диска.
+
+        Chroma кэширует «систему» глобально по пути к каталогу. Если просто
+        удалить каталог, следующий PersistentClient вернёт закэшированный
+        объект, держащий уже несуществующий sqlite, и первая же запись упадёт
+        с «attempt to write a readonly database». Поэтому: сначала штатный
+        reset(), затем сброс глобального кэша систем.
+        """
+        if self._client is not None:
+            try:
+                self._client.reset()
+            except Exception as error:  # noqa: BLE001 — reset может быть запрещён
+                log.debug("chroma reset: %s", error)
+
+        self._collection = None
+        self._client = None
+
+        # Путь к SharedSystemClient переезжал между версиями chromadb.
+        for module_path in ("chromadb.api.shared_system_client", "chromadb.api.client"):
+            try:
+                module = importlib.import_module(module_path)
+            except Exception:  # noqa: BLE001
+                continue
+            shared = getattr(module, "SharedSystemClient", None)
+            clear_cache = getattr(shared, "clear_system_cache", None)
+            if callable(clear_cache):
+                try:
+                    clear_cache()
+                    return
+                except Exception as error:  # noqa: BLE001
+                    log.debug("clear_system_cache: %s", error)
+        log.warning(
+            "Не нашёл SharedSystemClient.clear_system_cache — если после очистки "
+            "индексация не заработает, перезапустите сервер."
+        )
+
     def clear(self) -> dict[str, Any]:
         before = 0
         try:
@@ -1235,14 +1294,8 @@ class KnowledgeBase:
             pass
         files_before = len(self.manifest.get("files", {}))
 
-        try:
-            if self._client is not None:
-                self._client.delete_collection(name=COLLECTION_NAME)
-        except Exception as error:  # noqa: BLE001 — коллекции могло и не быть
-            log.debug("delete_collection: %s", error)
+        self._release_chroma()
 
-        self._collection = None
-        self._client = None
         self._bm25 = None
         self._bm25_ids = []
         self._bm25_tokens = []
@@ -1472,12 +1525,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+SERVER_INSTRUCTIONS = (
+    "Локальная база знаний по этому проекту: Go-код и документация из Confluence.\n\n"
+    "Прежде чем отвечать на вопросы об устройстве сервиса, бизнес-логике, именах "
+    "функций и типов или о том, где что лежит, вызывайте search_knowledge_base — "
+    "поиск гибридный, он одинаково хорошо ловит и смысл вопроса, и точные имена "
+    "символов. Тип источника в выдаче: Code — это Go-код, Confluence — документация.\n\n"
+    "Если поиск ничего не находит, скорее всего каталог ещё не проиндексирован: "
+    "вызовите index_directory с абсолютным путём к корню проекта (и отдельно — "
+    "к каталогу с выгрузкой Confluence). Повторные вызовы дёшевы: неизменившиеся "
+    "файлы пропускаются по хэшу."
+)
+
+
 def build_server(knowledge_base: KnowledgeBase) -> Any:
     """Собирает low-level MCP Server поверх переданного хранилища."""
     import mcp.types as types
     from mcp.server.lowlevel import Server
 
-    server = Server(SERVER_NAME)
+    try:
+        server = Server(
+            SERVER_NAME, version=SERVER_VERSION, instructions=SERVER_INSTRUCTIONS
+        )
+    except TypeError:  # очень старая ветка SDK без этих параметров
+        server = Server(SERVER_NAME)
     # Chroma, BM25 и модель не рассчитаны на конкурентную запись —
     # сериализуем все обращения к хранилищу.
     gate = asyncio.Lock()
@@ -1651,6 +1722,28 @@ def selftest() -> int:
         result = knowledge_base.clear()
         print(format_clear_result(result, knowledge_base.stats()), file=sys.stderr)
         assert knowledge_base.stats()["chunks"] == 0, "после clear() индекс не пуст"
+
+        # Регресс: chromadb кэширует систему по пути, и после физического
+        # удаления каталога запись падала с «readonly database».
+        after_clear = knowledge_base.index_directory(str(source_dir))
+        assert after_clear.chunks_added == report.chunks_added, (
+            f"после clear() переиндексация дала {after_clear.chunks_added} чанков "
+            f"вместо {report.chunks_added}"
+        )
+        assert knowledge_base.search("CalculateVAT", top_k=3), (
+            "после clear() и переиндексации поиск ничего не находит"
+        )
+        print("Цикл очистка → переиндексация → поиск: OK", file=sys.stderr)
+
+        # Эмуляция перезапуска сервера: новый объект на том же каталоге.
+        reopened = KnowledgeBase(Path(home))
+        assert reopened.stats()["chunks"] == after_clear.total_chunks, (
+            "после перезапуска число чанков в индексе не совпало"
+        )
+        assert reopened.search("Repository", top_k=3), (
+            "после перезапуска индекс не читается с диска"
+        )
+        print("Переживание перезапуска сервера: OK", file=sys.stderr)
 
     print("=== Самопроверка пройдена ===", file=sys.stderr)
     return 0
