@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "go-confluence-kb": {
+      "type": "stdio",
+      "command": "/Users/ЗАМЕНИТЕ_НА_ВАШ_ЛОГИН/.local/share/go-confluence-mcp/venv/bin/python",
+      "args": [
+        "/Users/ЗАМЕНИТЕ_НА_ВАШ_ЛОГИН/.local/share/go-confluence-mcp/hybrid_knowledge_mcp.py"
+      ],
+      "env": {
+        "GO_CONFLUENCE_MCP_HOME": "/Users/ЗАМЕНИТЕ_НА_ВАШ_ЛОГИН/.local/share/go-confluence-mcp",
+        "HF_HOME": "/Users/ЗАМЕНИТЕ_НА_ВАШ_ЛОГИН/.local/share/go-confluence-mcp/models",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "ANONYMIZED_TELEMETRY": "False",
+        "OMP_NUM_THREADS": "4",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
+    }
+  }
+}

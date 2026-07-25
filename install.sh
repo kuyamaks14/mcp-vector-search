@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+#
+# install.sh — полностью автоматическая установка локального MCP-сервера
+# гибридного поиска по Go-коду и документации Confluence на macOS.
+#
+# Что делает:
+#   1. Проверяет ОС и находит подходящий python3 (>= 3.10).
+#   2. Создаёт ~/.local/share/go-confluence-mcp/ и кладёт туда сервер.
+#   3. Разворачивает venv, обновляет pip, ставит зависимости одной командой.
+#   4. Заранее скачивает модель all-MiniLM-L6-v2 (холодный старт),
+#      чтобы Claude Code не подвисал на первом поиске.
+#   5. Прогоняет сквозную самопроверку: индексация → поиск → очистка.
+#   6. Аккуратно прописывает сервер в ~/.claude.json (с бэкапом).
+#
+# Скрипт идемпотентен: повторный запуск ничего не ломает.
+#
+# Использование:
+#   ./install.sh                     обычная установка
+#   ./install.sh --reinstall         пересоздать venv с нуля
+#   ./install.sh --skip-claude-config  не трогать ~/.claude.json
+#   ./install.sh --skip-selftest     пропустить самопроверку
+#   ./install.sh --dir /custom/path  другой каталог установки
+
+set -Eeuo pipefail
+
+# --------------------------------------------------------------------------- #
+# Параметры                                                                    #
+# --------------------------------------------------------------------------- #
+
+SERVER_FILE="hybrid_knowledge_mcp.py"
+MCP_SERVER_NAME="go-confluence-kb"
+INSTALL_DIR="${HOME}/.local/share/go-confluence-mcp"
+CLAUDE_CONFIG="${HOME}/.claude.json"
+
+DO_REINSTALL=0
+SKIP_CLAUDE_CONFIG=0
+SKIP_SELFTEST=0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --------------------------------------------------------------------------- #
+# Вывод                                                                        #
+# --------------------------------------------------------------------------- #
+
+if [ -t 1 ]; then
+    C_RESET="$(printf '\033[0m')"
+    C_BOLD="$(printf '\033[1m')"
+    C_BLUE="$(printf '\033[34m')"
+    C_GREEN="$(printf '\033[32m')"
+    C_YELLOW="$(printf '\033[33m')"
+    C_RED="$(printf '\033[31m')"
+    C_DIM="$(printf '\033[2m')"
+else
+    C_RESET=""; C_BOLD=""; C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""
+fi
+
+STEP_NO=0
+step()  { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%d/8] %s%s\n' "${C_BOLD}${C_BLUE}" "$STEP_NO" "$*" "$C_RESET"; }
+info()  { printf '      %s\n' "$*"; }
+dim()   { printf '      %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+ok()    { printf '      %s✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '      %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+die()   { printf '\n%s✘ %s%s\n\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+
+on_error() {
+    local exit_code=$?
+    printf '\n%s✘ Установка прервана: строка %s, код выхода %s%s\n' \
+        "$C_RED" "${1:-?}" "$exit_code" "$C_RESET" >&2
+    printf '  Каталог установки: %s\n' "$INSTALL_DIR" >&2
+    printf '  Повторите запуск с флагом --reinstall, если venv повреждён.\n\n' >&2
+    exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
+# --------------------------------------------------------------------------- #
+# Разбор аргументов                                                            #
+# --------------------------------------------------------------------------- #
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --reinstall)          DO_REINSTALL=1; shift ;;
+        --skip-claude-config) SKIP_CLAUDE_CONFIG=1; shift ;;
+        --skip-selftest)      SKIP_SELFTEST=1; shift ;;
+        --dir)
+            [ $# -ge 2 ] || die "--dir требует значение"
+            INSTALL_DIR="$2"; shift 2 ;;
+        --name)
+            [ $# -ge 2 ] || die "--name требует значение"
+            MCP_SERVER_NAME="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) die "Неизвестный аргумент: $1 (см. --help)" ;;
+    esac
+done
+
+VENV_DIR="${INSTALL_DIR}/venv"
+VENV_PY="${VENV_DIR}/bin/python"
+MODELS_DIR="${INSTALL_DIR}/models"
+SERVER_PATH="${INSTALL_DIR}/${SERVER_FILE}"
+
+printf '%s\n' "${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
+printf '%s\n' "${C_BOLD}  Локальный MCP: гибридный поиск по Go-коду и Confluence${C_RESET}"
+printf '%s\n' "${C_BOLD}════════════════════════════════════════════════════════════════${C_RESET}"
+
+# --------------------------------------------------------------------------- #
+# 1. Проверка окружения                                                        #
+# --------------------------------------------------------------------------- #
+
+step "Проверяю окружение"
+
+OS_NAME="$(uname -s)"
+if [ "$OS_NAME" != "Darwin" ]; then
+    warn "Скрипт рассчитан на macOS, обнаружено: ${OS_NAME}. Продолжаю на свой риск."
+else
+    ok "macOS $(sw_vers -productVersion 2>/dev/null || echo '') $(uname -m)"
+fi
+
+[ -f "${SCRIPT_DIR}/${SERVER_FILE}" ] \
+    || die "Рядом со скриптом нет ${SERVER_FILE} (искал в ${SCRIPT_DIR})"
+ok "Исходник сервера найден: ${SCRIPT_DIR}/${SERVER_FILE}"
+
+# Ищем python3 >= 3.10: сначала штатный, затем конкретные версии.
+PYTHON_BIN=""
+for candidate in python3 python3.13 python3.12 python3.11 python3.10; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
+        PYTHON_BIN="$(command -v "$candidate")"
+        break
+    fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+    printf '\n%s✘ Не найден Python 3.10+%s\n\n' "$C_RED" "$C_RESET" >&2
+    printf '  Установите его, например через Homebrew:\n' >&2
+    printf '      brew install python@3.12\n\n' >&2
+    exit 1
+fi
+
+PY_VERSION="$("$PYTHON_BIN" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
+ok "Python ${PY_VERSION} → ${PYTHON_BIN}"
+
+if "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 14) else 1)' 2>/dev/null; then
+    warn "Python ${PY_VERSION} очень свежий — колёса torch для него могут быть недоступны."
+fi
+
+command -v git >/dev/null 2>&1 || warn "git не найден (не критично)"
+
+# --------------------------------------------------------------------------- #
+# 2. Каталоги и перенос кода                                                   #
+# --------------------------------------------------------------------------- #
+
+step "Готовлю каталог установки"
+
+mkdir -p "${INSTALL_DIR}" "${MODELS_DIR}" "${INSTALL_DIR}/data"
+ok "Каталог: ${INSTALL_DIR}"
+
+cp "${SCRIPT_DIR}/${SERVER_FILE}" "${SERVER_PATH}"
+chmod 0755 "${SERVER_PATH}"
+ok "Сервер скопирован: ${SERVER_PATH}"
+
+# --------------------------------------------------------------------------- #
+# 3. Виртуальное окружение                                                     #
+# --------------------------------------------------------------------------- #
+
+step "Создаю виртуальное окружение"
+
+if [ "$DO_REINSTALL" -eq 1 ] && [ -d "$VENV_DIR" ]; then
+    info "Флаг --reinstall: удаляю старый venv"
+    rm -rf "$VENV_DIR"
+fi
+
+if [ -x "$VENV_PY" ]; then
+    ok "venv уже существует: ${VENV_DIR}"
+else
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+    ok "venv создан: ${VENV_DIR}"
+fi
+
+[ -x "$VENV_PY" ] || die "venv собран некорректно, нет ${VENV_PY}. Запустите с --reinstall"
+
+# --------------------------------------------------------------------------- #
+# 4. Зависимости                                                               #
+# --------------------------------------------------------------------------- #
+
+step "Обновляю pip и ставлю зависимости"
+
+info "Это самый долгий шаг: torch весит ~250 МБ, суммарно нужно ~2.5 ГБ."
+
+"$VENV_PY" -m pip install --upgrade --disable-pip-version-check --quiet pip setuptools wheel
+ok "pip $("$VENV_PY" -m pip --version | awk '{print $2}')"
+
+# На Intel-маках сборки torch остановились на 2.2 — не пиним минимум,
+# пусть резолвер сам возьмёт последнее доступное колесо.
+if [ "$(uname -m)" = "x86_64" ]; then
+    TORCH_SPEC="torch"
+else
+    TORCH_SPEC="torch>=2.2.0"
+fi
+
+# mcp 2.x ломает low-level API (переход на сигнатуру (ctx, params)) — держимся 1.x.
+DEPS="mcp>=1.9.0,<2.0.0
+sentence-transformers>=3.0.0,<6.0.0
+chromadb>=0.5.5,<2.0.0
+rank-bm25>=0.2.2
+${TORCH_SPEC}"
+
+printf '%s\n' "$DEPS" > "${INSTALL_DIR}/requirements.txt"
+dim "Список зафиксирован в ${INSTALL_DIR}/requirements.txt"
+
+# Одной командой, как и задумано.
+"$VENV_PY" -m pip install --upgrade --disable-pip-version-check \
+    "mcp>=1.9.0,<2.0.0" \
+    "sentence-transformers>=3.0.0,<6.0.0" \
+    "chromadb>=0.5.5,<2.0.0" \
+    "rank-bm25>=0.2.2" \
+    "$TORCH_SPEC"
+
+ok "Зависимости установлены"
+
+"$VENV_PY" - <<'PY'
+import importlib.metadata as md
+import sys
+for name in ("mcp", "sentence-transformers", "chromadb", "rank-bm25", "torch", "numpy"):
+    try:
+        print("      %-22s %s" % (name, md.version(name)))
+    except md.PackageNotFoundError:
+        print("      %-22s ОТСУТСТВУЕТ" % name, file=sys.stderr)
+        sys.exit(1)
+PY
+
+# --------------------------------------------------------------------------- #
+# 5. Холодная загрузка модели                                                  #
+# --------------------------------------------------------------------------- #
+
+step "Скачиваю модель all-MiniLM-L6-v2 (холодный старт)"
+
+export HF_HOME="${MODELS_DIR}"
+export HF_HUB_DISABLE_TELEMETRY=1
+export TOKENIZERS_PARALLELISM=false
+export ANONYMIZED_TELEMETRY=False
+
+info "Модель кладётся в ${MODELS_DIR} — Claude Code не будет ждать её при первом поиске."
+
+"$VENV_PY" "$SERVER_PATH" --warmup --base-dir "$INSTALL_DIR"
+
+MODEL_SIZE="$(du -sh "${MODELS_DIR}" 2>/dev/null | awk '{print $1}')"
+ok "Модель на диске (${MODEL_SIZE:-?})"
+
+# --------------------------------------------------------------------------- #
+# 6. Самопроверка                                                              #
+# --------------------------------------------------------------------------- #
+
+step "Сквозная самопроверка"
+
+if [ "$SKIP_SELFTEST" -eq 1 ]; then
+    warn "Пропущена по флагу --skip-selftest"
+else
+    info "Индексация → повторная индексация по хэшам → гибридный поиск → очистка."
+    if "$VENV_PY" "$SERVER_PATH" --selftest --base-dir "$INSTALL_DIR" 2>&1 | sed 's/^/      /'; then
+        ok "Все проверки пройдены"
+    else
+        die "Самопроверка не прошла — смотрите вывод выше"
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 7. Конфигурация Claude Code                                                  #
+# --------------------------------------------------------------------------- #
+
+step "Прописываю сервер в ${CLAUDE_CONFIG}"
+
+CONFIG_SNIPPET="${INSTALL_DIR}/claude_mcp_config.json"
+"$VENV_PY" - "$CONFIG_SNIPPET" "$MCP_SERVER_NAME" "$VENV_PY" "$SERVER_PATH" "$INSTALL_DIR" <<'PY'
+import json, sys
+out, name, command, server, home = sys.argv[1:6]
+entry = {
+    "type": "stdio",
+    "command": command,
+    "args": [server],
+    "env": {
+        "GO_CONFLUENCE_MCP_HOME": home,
+        "HF_HOME": home + "/models",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "ANONYMIZED_TELEMETRY": "False",
+        "OMP_NUM_THREADS": "4",
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+    },
+}
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump({"mcpServers": {name: entry}}, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PY
+dim "Готовый фрагмент конфига: ${CONFIG_SNIPPET}"
+
+if [ "$SKIP_CLAUDE_CONFIG" -eq 1 ]; then
+    warn "Пропущено по флагу --skip-claude-config"
+else
+    if pgrep -x claude >/dev/null 2>&1; then
+        warn "Claude Code сейчас запущен — он перезаписывает ~/.claude.json при выходе."
+        warn "После установки закройте и откройте его заново."
+    fi
+
+    set +e
+    MERGE_OUTPUT="$("$VENV_PY" - "$CLAUDE_CONFIG" "$CONFIG_SNIPPET" "$MCP_SERVER_NAME" <<'PY'
+import json, os, shutil, sys, time
+
+config_path, snippet_path, name = sys.argv[1:4]
+
+with open(snippet_path, encoding="utf-8") as handle:
+    entry = json.load(handle)["mcpServers"][name]
+
+# Пишем по реальному пути, чтобы не заменить симлинк обычным файлом.
+target = os.path.realpath(config_path)
+
+data = {}
+action = "создан"
+if os.path.exists(target) and os.path.getsize(target) > 0:
+    try:
+        with open(target, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        print("PARSE_ERROR: %s" % error)
+        sys.exit(2)
+    if not isinstance(data, dict):
+        print("PARSE_ERROR: корень ~/.claude.json не является JSON-объектом")
+        sys.exit(2)
+
+    backup = "%s.backup-%s" % (target, time.strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(target, backup)
+    print("BACKUP: %s" % backup)
+    action = "обновлён"
+
+servers = data.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+
+replaced = name in servers
+servers[name] = entry
+data["mcpServers"] = servers
+
+tmp = target + ".tmp-install"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+os.replace(tmp, target)
+
+print("OK: %s (%s), запись '%s' %s" % (
+    target, action, name, "заменена" if replaced else "добавлена"))
+print("SERVERS: %s" % ", ".join(sorted(servers)))
+PY
+)"
+    MERGE_STATUS=$?
+    set -e
+
+    printf '%s\n' "$MERGE_OUTPUT" | sed 's/^/      /'
+
+    if [ "$MERGE_STATUS" -eq 0 ]; then
+        ok "Конфигурация Claude Code обновлена"
+    else
+        warn "Не удалось разобрать ${CLAUDE_CONFIG} — файл НЕ тронут."
+        warn "Добавьте вручную содержимое ${CONFIG_SNIPPET} в блок \"mcpServers\"."
+    fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 8. Итог                                                                      #
+# --------------------------------------------------------------------------- #
+
+step "Готово"
+
+cat <<EOF
+
+${C_GREEN}${C_BOLD}Установка завершена.${C_RESET}
+
+  Сервер   : ${SERVER_PATH}
+  Python   : ${VENV_PY}
+  Индексы  : ${INSTALL_DIR}/data
+  Модель   : ${MODELS_DIR}
+
+${C_BOLD}Что делать дальше${C_RESET}
+
+  1. Откройте терминал в вашем Go-проекте и запустите:
+
+         ${C_BOLD}claude${C_RESET}
+
+  2. В первой же сессии попросите Claude проиндексировать источники:
+
+         > проиндексируй \$(pwd) через index_directory
+         > проиндексируй ~/Documents/confluence-export через index_directory
+
+  3. Дальше просто задавайте вопросы — Claude сам вызовет
+     search_knowledge_base и получит фрагменты Go-кода и документации.
+
+${C_DIM}  Проверить, что сервер подхватился:  claude mcp list
+  Полная пересборка индекса:          попросите Claude вызвать clear_index
+  Логи сервера пишутся в stderr и видны в выводе Claude Code.${C_RESET}
+
+EOF
