@@ -8,7 +8,7 @@
 #   2. Создаёт ~/.local/share/go-confluence-mcp/ и кладёт туда сервер.
 #   3. Разворачивает venv, обновляет pip, ставит зависимости одной командой.
 #   4. Заранее скачивает модель all-MiniLM-L6-v2 (холодный старт),
-#      чтобы Claude Code не подвисал на первом поиске.
+#      чтобы выбранный агент не подвисал на первом поиске.
 #   5. Прогоняет сквозную самопроверку: индексация → поиск → очистка.
 #   6. Аккуратно прописывает сервер в Claude Code или Codex.
 #
@@ -17,6 +17,8 @@
 # Использование:
 #   ./install.sh --client claude     установка для Claude Code
 #   ./install.sh --client codex      установка для Codex
+#     Codex настраивается в ~/.codex/config.toml и
+#     ~/.o3-cli/o3_plugin_agent/codex/config.toml
 #   ./install.sh --reinstall         пересоздать venv с нуля
 #   ./install.sh --skip-selftest     пропустить самопроверку
 #   ./install.sh --dir /custom/path  другой каталог установки
@@ -32,6 +34,7 @@ MCP_SERVER_NAME="go-confluence-kb"
 INSTALL_DIR="${HOME}/.local/share/go-confluence-mcp"
 CLAUDE_CONFIG="${HOME}/.claude.json"
 CODEX_CONFIG="${HOME}/.codex/config.toml"
+O3_CODEX_CONFIG="${HOME}/.o3-cli/o3_plugin_agent/codex/config.toml"
 
 DO_REINSTALL=0
 SKIP_CLAUDE_CONFIG=0
@@ -101,6 +104,14 @@ done
 
 if [ "$CLIENT" != "claude" ] && [ "$CLIENT" != "codex" ]; then
     die "укажите --client claude или --client codex"
+fi
+
+if [ "$CLIENT" = "claude" ]; then
+    CLIENT_LABEL="Claude Code"
+    CLIENT_COMMAND="claude"
+else
+    CLIENT_LABEL="Codex"
+    CLIENT_COMMAND="codex"
 fi
 
 VENV_DIR="${INSTALL_DIR}/venv"
@@ -250,7 +261,7 @@ export HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false
 export ANONYMIZED_TELEMETRY=False
 
-info "Модель кладётся в ${MODELS_DIR} — Claude Code не будет ждать её при первом поиске."
+info "Модель кладётся в ${MODELS_DIR} — ${CLIENT_LABEL} не будет ждать её при первом поиске."
 
 "$VENV_PY" "$SERVER_PATH" --warmup --base-dir "$INSTALL_DIR"
 
@@ -275,15 +286,15 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 7. Конфигурация Claude Code                                                  #
+# 7. Конфигурация клиента                                                      #
 # --------------------------------------------------------------------------- #
 
-step "Прописываю сервер в ${CLAUDE_CONFIG}"
+step "Настраиваю MCP для ${CLIENT_LABEL}"
 
 if [ "$CLIENT" = "codex" ]; then
-    step "Прописываю сервер в ${CODEX_CONFIG}"
-    mkdir -p "$(dirname "${CODEX_CONFIG}")"
-    "$VENV_PY" - "${SCRIPT_DIR}" "${CODEX_CONFIG}" "$MCP_SERVER_NAME" "$VENV_PY" "$SERVER_PATH" "$INSTALL_DIR" <<'PY'
+    for CODEX_TARGET in "${CODEX_CONFIG}" "${O3_CODEX_CONFIG}"; do
+        mkdir -p "$(dirname "${CODEX_TARGET}")"
+        "$VENV_PY" - "${SCRIPT_DIR}" "${CODEX_TARGET}" "$MCP_SERVER_NAME" "$VENV_PY" "$SERVER_PATH" "$INSTALL_DIR" <<'PY'
 import os, sys
 sys.path.insert(0, sys.argv[1])
 from installer_config import build_server_entry, merge_codex_config
@@ -296,7 +307,8 @@ with open(tmp, "w", encoding="utf-8") as handle:
     handle.write(content)
 os.replace(tmp, target)
 PY
-    ok "Конфигурация Codex обновлена"
+        ok "Конфигурация Codex обновлена: ${CODEX_TARGET}"
+    done
 else
 
 CONFIG_SNIPPET="${INSTALL_DIR}/claude_mcp_config.json"
@@ -412,20 +424,17 @@ ${C_GREEN}${C_BOLD}Установка завершена.${C_RESET}
 
 ${C_BOLD}Что делать дальше${C_RESET}
 
-  1. Откройте терминал в вашем Go-проекте и запустите:
+  1. Откройте терминал в вашем проекте и запустите ${CLIENT_LABEL}:
 
-         ${C_BOLD}claude${C_RESET}
+         ${C_BOLD}${CLIENT_COMMAND}${C_RESET}
 
-  2. В первой же сессии попросите Claude проиндексировать источники:
+  2. В первой же сессии попросите ${CLIENT_LABEL} получить страницы через
+     Confluence MCP и передать их в index_confluence_page.
 
-         > проиндексируй \$(pwd) через index_directory
-         > проиндексируй ~/Documents/confluence-export через index_directory
+  3. Дальше просто задавайте вопросы — ${CLIENT_LABEL} вызовет
+     search_confluence и получит фрагменты документации.
 
-  3. Дальше просто задавайте вопросы — Claude сам вызовет
-     search_knowledge_base и получит фрагменты Go-кода и документации.
-
-${C_DIM}  Проверить, что сервер подхватился:  claude mcp list
-  Полная пересборка индекса:          попросите Claude вызвать clear_index
-  Логи сервера пишутся в stderr и видны в выводе Claude Code.${C_RESET}
+${C_DIM}  Полная пересборка индекса: попросите ${CLIENT_LABEL} вызвать clear_index
+  Логи сервера пишутся в stderr и видны в выводе ${CLIENT_LABEL}.${C_RESET}
 
 EOF

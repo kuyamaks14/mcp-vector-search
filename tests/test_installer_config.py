@@ -1,4 +1,6 @@
+import subprocess
 import unittest
+from pathlib import Path
 
 import installer_config
 
@@ -12,6 +14,17 @@ class InstallerConfigTests(unittest.TestCase):
         self.assertIn('[mcp_servers.rag]', second)
         self.assertIn('[profiles.dev]', second)
         self.assertEqual(second.count("BEGIN confluence-rag-mcp"), 1)
+
+    def test_help_names_codex_and_its_two_config_files(self):
+        script = Path(__file__).resolve().parents[1] / "install.sh"
+
+        result = subprocess.run(
+            ["bash", str(script), "--help"], check=False, capture_output=True, text=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Codex", result.stdout)
+        self.assertIn("~/.o3-cli/o3_plugin_agent/codex/config.toml", result.stdout)
 
 
 if __name__ == "__main__":
