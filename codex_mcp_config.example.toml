@@ -1,0 +1,4 @@
+[mcp_servers.confluence-rag]
+command = "/absolute/path/to/venv/bin/python"
+args = ["/absolute/path/to/hybrid_knowledge_mcp.py"]
+env = { GO_CONFLUENCE_MCP_HOME = "/absolute/path/to/confluence-rag-mcp", HF_HOME = "/absolute/path/to/confluence-rag-mcp/models" }
