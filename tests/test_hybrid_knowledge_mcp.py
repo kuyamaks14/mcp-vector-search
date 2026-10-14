@@ -32,6 +32,9 @@ class PageIndexLifecycleTests(unittest.TestCase):
 
 
 class McpApiTests(unittest.TestCase):
+    def test_server_uses_confluence_rag_name(self):
+        self.assertEqual(rag.SERVER_NAME, "confluence-rag")
+
     def test_exposes_confluence_only_tools(self):
         names = {item["name"] for item in rag.TOOL_DEFINITIONS}
 

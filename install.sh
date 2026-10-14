@@ -5,7 +5,7 @@
 #
 # Что делает:
 #   1. Проверяет ОС и находит подходящий python3 (>= 3.10).
-#   2. Создаёт ~/.local/share/go-confluence-mcp/ и кладёт туда сервер.
+#   2. Создаёт ~/.local/share/confluence-rag-mcp/ и кладёт туда сервер.
 #   3. Разворачивает venv, обновляет pip, ставит зависимости одной командой.
 #   4. Заранее скачивает модель all-MiniLM-L6-v2 (холодный старт),
 #      чтобы выбранный агент не подвисал на первом поиске.
@@ -30,8 +30,8 @@ set -Eeuo pipefail
 # --------------------------------------------------------------------------- #
 
 SERVER_FILE="hybrid_knowledge_mcp.py"
-MCP_SERVER_NAME="go-confluence-kb"
-INSTALL_DIR="${HOME}/.local/share/go-confluence-mcp"
+MCP_SERVER_NAME="confluence-rag"
+INSTALL_DIR="${HOME}/.local/share/confluence-rag-mcp"
 CLAUDE_CONFIG="${HOME}/.claude.json"
 CODEX_CONFIG="${HOME}/.codex/config.toml"
 O3_CODEX_CONFIG="${HOME}/.o3-cli/o3_plugin_agent/codex/config.toml"

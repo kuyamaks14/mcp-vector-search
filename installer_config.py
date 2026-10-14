@@ -7,6 +7,9 @@ from collections.abc import Mapping
 from typing import Any
 
 
+_LEGACY_CODEX_SERVER_NAMES = {"go-confluence-kb", "go-confluence-mcp"}
+
+
 def build_server_entry(command: str, server_path: str, home: str) -> dict[str, Any]:
     return {
         "command": command,
@@ -30,6 +33,31 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _is_legacy_codex_table(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped.startswith("["):
+        return False
+
+    header_end = stripped.find("]")
+    if header_end < 0:
+        return False
+
+    header = stripped[1:header_end]
+    parts = [part.strip().strip('"\'') for part in header.split(".")]
+    return len(parts) >= 2 and parts[0] == "mcp_servers" and parts[1] in _LEGACY_CODEX_SERVER_NAMES
+
+
+def _remove_legacy_codex_server(existing: str) -> str:
+    result: list[str] = []
+    remove_current_table = False
+    for line in existing.splitlines(keepends=True):
+        if line.lstrip().startswith("["):
+            remove_current_table = _is_legacy_codex_table(line)
+        if not remove_current_table:
+            result.append(line)
+    return "".join(result)
+
+
 def merge_codex_config(existing: str, name: str, entry: Mapping[str, Any]) -> str:
     begin = "# BEGIN confluence-rag-mcp"
     end = "# END confluence-rag-mcp"
@@ -44,6 +72,7 @@ def merge_codex_config(existing: str, name: str, entry: Mapping[str, Any]) -> st
         end,
     ]
     block = "\n".join(lines) + "\n"
+    existing = _remove_legacy_codex_server(existing)
     start = existing.find(begin)
     if start < 0:
         return existing.rstrip() + "\n\n" + block

@@ -20,7 +20,7 @@ hybrid_knowledge_mcp.py — локальный MCP-сервер гибридно
 * search_knowledge_base(query, top_k) — гибридный поиск (векторы + BM25 + RRF).
 * clear_index()                     — полная очистка индексов, кэша хэшей и БД.
 
-Раскладка на диске (по умолчанию ~/.local/share/go-confluence-mcp):
+Раскладка на диске (по умолчанию ~/.local/share/confluence-rag-mcp):
     hybrid_knowledge_mcp.py   — этот файл
     venv/                     — виртуальное окружение
     models/                   — HF_HOME, сюда заранее скачивается MiniLM
@@ -90,13 +90,13 @@ from typing import Any, Iterable, Iterator, Sequence  # noqa: E402
 # 1. Конфигурация                                                              #
 # --------------------------------------------------------------------------- #
 
-SERVER_NAME = "go-confluence-kb"
+SERVER_NAME = "confluence-rag"
 SERVER_VERSION = "1.0.0"
 
 DEFAULT_BASE_DIR = Path(
     os.environ.get(
         "GO_CONFLUENCE_MCP_HOME",
-        Path.home() / ".local" / "share" / "go-confluence-mcp",
+        Path.home() / ".local" / "share" / "confluence-rag-mcp",
     )
 ).expanduser()
 
@@ -173,7 +173,7 @@ for _noisy in (
 ):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-log = logging.getLogger("go-confluence-kb")
+log = logging.getLogger("confluence-rag")
 
 
 # --------------------------------------------------------------------------- #
@@ -1848,7 +1848,7 @@ def main() -> int:
     parser.add_argument(
         "--base-dir",
         default=str(DEFAULT_BASE_DIR),
-        help="каталог с индексами (по умолчанию ~/.local/share/go-confluence-mcp)",
+        help="каталог с индексами (по умолчанию ~/.local/share/confluence-rag-mcp)",
     )
     parser.add_argument(
         "--selftest",
